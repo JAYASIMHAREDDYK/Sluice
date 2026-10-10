@@ -1,0 +1,16 @@
+{
+  "name": "sluice",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "gateway": "node gateway/main.js",
+    "worker": "node worker/main.js",
+    "test": "node --test idempotency.test.js"
+  },
+  "dependencies": {
+    "fastify": "^4.26.2",
+    "ioredis": "^5.4.1",
+    "kafkajs": "^2.2.4",
+    "pg": "^8.11.3"
+  }
+}
