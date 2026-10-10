@@ -24,6 +24,45 @@ Run tests:
 npm test
 ```
 
+## Architecture
+
+```mermaid
+flowchart TD
+    Client(["Client HTTP Requests"])
+
+    subgraph Ingestion ["Ingestion Gateway (Fastify)"]
+        GW["POST /transactions"]
+        RL["Token Bucket Rate Limiter<br/>(Redis TIME in Lua)"]
+        IDEMP["Idempotency & SHA-256 Check<br/>(30s In-Flight Lease)"]
+        PROD["Kafka Producer<br/>(acks: -1)"]
+    end
+
+    subgraph StorageCache ["Storage & Streaming"]
+        R[("Redis 7<br/>Buckets & Cached 202s")]
+        K[["Kafka 3.7<br/>transactions Topic"]]
+        DLQ[["Kafka 3.7<br/>transactions.dlq Topic"]]
+    end
+
+    subgraph Persistence ["Persistence Layer"]
+        W["Background Worker<br/>(Batch Consumer)"]
+        PG[("PostgreSQL 15<br/>accounts & idempotency_keys")]
+    end
+
+    Client -->|"1. POST request"| GW
+    GW --> RL
+    RL <-->|"TIME & token checks"| R
+    GW --> IDEMP
+    IDEMP <-->|"In-flight lease & cache"| R
+    GW -->|"Publish event"| PROD
+    PROD -->|"Buffered messages"| K
+    GW -.->|"202 Accepted (queued)"| Client
+
+    K -->|"2. Fetch batch"| W
+    W -->|"3. SELECT FOR UPDATE (sorted)<br/>INSERT ON CONFLICT"| PG
+    W -.->|"4. Offset commit (after write)"| K
+    W -->|"5 failures -> DLQ"| DLQ
+```
+
 ## Request Flow
 
 1. Client sends `POST /transactions` with `x-tenant-id` and `x-idempotency-key`.
