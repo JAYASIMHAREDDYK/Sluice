@@ -8,6 +8,7 @@ const DLQ_TOPIC = process.env.DLQ_TOPIC || 'transactions.dlq';
 const GROUP_ID = process.env.GROUP_ID || 'sluice-worker-group';
 
 const pool = new pg.Pool({ connectionString: PG_URL });
+pool.on('error', (err) => console.error('database pool error:', err.message));
 const kafka = new Kafka({ clientId: 'worker', brokers: KAFKA_BROKERS });
 const consumer = kafka.consumer({ groupId: GROUP_ID });
 const producer = kafka.producer();
