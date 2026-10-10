@@ -29,6 +29,7 @@ test('10,000 concurrent requests with one key produce 1 kafka message and 1 post
     env: {
       ...process.env,
       PORT: String(PORT),
+      TOPIC,
       RATE_CAPACITY: '25000',
       RATE_PER_SECOND: '25000'
     },
@@ -36,9 +37,19 @@ test('10,000 concurrent requests with one key produce 1 kafka message and 1 post
   });
 
   const worker = spawn('node', ['worker/main.js'], {
-    env: { ...process.env },
+    env: {
+      ...process.env,
+      TOPIC,
+      FROM_BEGINNING: 'true',
+      GROUP_ID: `test-worker-${Date.now()}`
+    },
     stdio: ['ignore', 'pipe', 'pipe']
   });
+
+  gateway.stdout.on('data', d => console.log('gateway stdout:', d.toString()));
+  gateway.stderr.on('data', d => console.error('gateway stderr:', d.toString()));
+  worker.stdout.on('data', d => console.log('worker stdout:', d.toString()));
+  worker.stderr.on('data', d => console.error('worker stderr:', d.toString()));
 
   const kafka = new Kafka({ clientId: 'test-inspector', brokers: KAFKA_BROKERS });
   const consumer = kafka.consumer({ groupId: `inspector-${Date.now()}` });
@@ -101,16 +112,20 @@ test('10,000 concurrent requests with one key produce 1 kafka message and 1 post
     const status202Count = responses.filter(r => r.status === 202).length;
     assert.strictEqual(status202Count, 10000, 'every response must return 202');
 
-    // allow worker and test consumer to process kafka batch
-    await new Promise(r => setTimeout(r, 6000));
+    // poll until worker finishes processing kafka batch
+    let txCount = 0;
+    for (let i = 0; i < 30; i++) {
+      const txRes = await pool.query(
+        'SELECT count(*)::int as count FROM transactions WHERE tenant_id = $1 AND idempotency_key = $2',
+        [tenantId, idempotencyKey]
+      );
+      txCount = txRes.rows[0].count;
+      if (txCount > 0) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
 
     assert.strictEqual(kafkaMessages.length, 1, `expected exactly 1 kafka message, received ${kafkaMessages.length}`);
-
-    const txRes = await pool.query(
-      'SELECT count(*)::int as count FROM transactions WHERE tenant_id = $1 AND idempotency_key = $2',
-      [tenantId, idempotencyKey]
-    );
-    assert.strictEqual(txRes.rows[0].count, 1, `expected exactly 1 transaction in postgres, found ${txRes.rows[0].count}`);
+    assert.strictEqual(txCount, 1, `expected exactly 1 transaction in postgres, found ${txCount}`);
 
     const keyRes = await pool.query(
       'SELECT count(*)::int as count FROM idempotency_keys WHERE tenant_id = $1 AND idempotency_key = $2',

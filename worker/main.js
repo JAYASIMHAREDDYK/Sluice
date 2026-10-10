@@ -84,10 +84,12 @@ export async function sendToDeadLetters(producer, dlqTopic, message, errorText) 
   });
 }
 
+const FROM_BEGINNING = process.env.FROM_BEGINNING === 'true';
+
 async function read() {
   await producer.connect();
   await consumer.connect();
-  await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
+  await consumer.subscribe({ topic: TOPIC, fromBeginning: FROM_BEGINNING });
   console.log(`worker listening to topic ${TOPIC}`);
 
   await consumer.run({
