@@ -4,11 +4,15 @@ import { Kafka } from 'kafkajs';
 const PG_URL = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/sluice';
 const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
 const TOPIC = process.env.TOPIC || 'transactions';
+const DLQ_TOPIC = process.env.DLQ_TOPIC || 'transactions.dlq';
 const GROUP_ID = process.env.GROUP_ID || 'sluice-worker-group';
 
 const pool = new pg.Pool({ connectionString: PG_URL });
 const kafka = new Kafka({ clientId: 'worker', brokers: KAFKA_BROKERS });
 const consumer = kafka.consumer({ groupId: GROUP_ID });
+const producer = kafka.producer();
+
+const attemptCounts = new Map();
 
 export async function saveTransactions(pool, transactions) {
   if (transactions.length === 0) return;
@@ -61,7 +65,26 @@ export async function saveTransactions(pool, transactions) {
   }
 }
 
+export async function sendToDeadLetters(producer, dlqTopic, message, errorText) {
+  const key = `${message.tenant_id}:${message.account_id}`;
+  await producer.send({
+    topic: dlqTopic,
+    acks: -1,
+    messages: [
+      {
+        key,
+        value: JSON.stringify({
+          ...message,
+          error: errorText,
+          failed_at: new Date().toISOString()
+        })
+      }
+    ]
+  });
+}
+
 async function read() {
+  await producer.connect();
   await consumer.connect();
   await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
   console.log(`worker listening to topic ${TOPIC}`);
@@ -69,25 +92,54 @@ async function read() {
   await consumer.run({
     eachBatchAutoResolve: false,
     eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary }) => {
-      const parsed = [];
+      const items = [];
       for (const msg of batch.messages) {
         try {
-          parsed.push({
+          items.push({
             raw: msg,
             data: JSON.parse(msg.value.toString())
           });
         } catch (err) {
           console.error('unparseable message skipped:', err.message);
+          resolveOffset(msg.offset);
         }
       }
 
-      if (parsed.length > 0) {
-        await saveTransactions(pool, parsed.map(p => p.data));
+      if (items.length === 0) {
+        await commitOffsetsIfNecessary();
+        return;
       }
 
-      for (const item of parsed) {
-        resolveOffset(item.raw.offset);
+      try {
+        await saveTransactions(pool, items.map(item => item.data));
+        for (const item of items) {
+          attemptCounts.delete(item.raw.offset);
+          resolveOffset(item.raw.offset);
+        }
+      } catch (err) {
+        console.error('batch processing failed:', err.message);
+        // process items one by one on batch failure to isolate poisoned messages
+        for (const item of items) {
+          const attempts = (attemptCounts.get(item.raw.offset) || 0) + 1;
+          attemptCounts.set(item.raw.offset, attempts);
+
+          try {
+            await saveTransactions(pool, [item.data]);
+            attemptCounts.delete(item.raw.offset);
+            resolveOffset(item.raw.offset);
+          } catch (itemErr) {
+            if (attempts >= 5) {
+              // dead letter after 5 attempts so bad payload does not block healthy partitions forever
+              await sendToDeadLetters(producer, DLQ_TOPIC, item.data, itemErr.message);
+              attemptCounts.delete(item.raw.offset);
+              resolveOffset(item.raw.offset);
+            } else {
+              throw itemErr;
+            }
+          }
+        }
       }
+
       await commitOffsetsIfNecessary();
       await heartbeat();
     }
