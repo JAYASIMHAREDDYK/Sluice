@@ -1,16 +1,17 @@
 const DEFAULT_TTL = Number(process.env.IDEMPOTENCY_TTL_SECONDS || 86400);
+const IN_FLIGHT_TTL = Number(process.env.IN_FLIGHT_TTL_SECONDS || 30);
 
 const script = `
 local key = KEYS[1]
 local sha = ARGV[1]
-local ttl = tonumber(ARGV[2])
+local in_flight_ttl = tonumber(ARGV[2])
 local initial_response = ARGV[3]
 
 local exists = redis.call('EXISTS', key)
 if exists == 0 then
-  -- reserve key atomically to prevent concurrent requests from publishing duplicate messages
-  redis.call('HSET', key, 'sha', sha, 'response', initial_response)
-  redis.call('EXPIRE', key, ttl)
+  -- reserve key with short ttl so crash before kafka publish unblocks retries
+  redis.call('HSET', key, 'sha', sha, 'status', 'queued', 'response', initial_response)
+  redis.call('EXPIRE', key, in_flight_ttl)
   return { 0, '' }
 end
 
@@ -24,7 +25,7 @@ else
 end
 `;
 
-export async function alreadySeen(redis, tenantId, idempotencyKey, bodySha, initialResponse = {}, ttl = DEFAULT_TTL) {
+export async function alreadySeen(redis, tenantId, idempotencyKey, bodySha, initialResponse = {}, inFlightTtl = IN_FLIGHT_TTL) {
   if (!redis.checkSeen) {
     redis.defineCommand('checkSeen', {
       numberOfKeys: 1,
@@ -33,7 +34,7 @@ export async function alreadySeen(redis, tenantId, idempotencyKey, bodySha, init
   }
   const key = `seen:${tenantId}:${idempotencyKey}`;
   const responsePayload = JSON.stringify(initialResponse);
-  const [code, stored] = await redis.checkSeen(key, bodySha, ttl, responsePayload);
+  const [code, stored] = await redis.checkSeen(key, bodySha, inFlightTtl, responsePayload);
 
   if (code === 0) {
     return { seen: false };
@@ -50,7 +51,7 @@ export async function alreadySeen(redis, tenantId, idempotencyKey, bodySha, init
 
 export async function markDone(redis, tenantId, idempotencyKey, response, ttl = DEFAULT_TTL) {
   const key = `seen:${tenantId}:${idempotencyKey}`;
-  await redis.hset(key, 'response', JSON.stringify(response));
+  await redis.hset(key, 'response', JSON.stringify(response), 'status', 'done');
   await redis.expire(key, ttl);
 }
 

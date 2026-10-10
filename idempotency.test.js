@@ -8,7 +8,7 @@ import { Kafka } from 'kafkajs';
 const PG_URL = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/sluice';
 const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || 'localhost:9092').split(',');
 const TOPIC = process.env.TOPIC || 'transactions';
-const PORT = 3000;
+const PORT = 3001;
 
 function stopProcess(proc) {
   if (proc && proc.pid) {
